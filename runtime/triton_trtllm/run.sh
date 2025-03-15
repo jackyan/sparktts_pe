@@ -41,7 +41,7 @@ if [ $stage -le 2 ] && [ $stop_stage -ge 2 ]; then
     MAX_QUEUE_DELAY_MICROSECONDS=0
     MODEL_DIR=$huggingface_model_local_dir
     LLM_TOKENIZER_DIR=$huggingface_model_local_dir/LLM
-    BLS_INSTANCE_NUM=4
+    BLS_INSTANCE_NUM=8  # Increased from 4
     TRITON_MAX_BATCH_SIZE=16
 
     python3 scripts/fill_template.py -i ${model_repo}/vocoder/config.pbtxt model_dir:${MODEL_DIR},triton_max_batch_size:${TRITON_MAX_BATCH_SIZE},max_queue_delay_microseconds:${MAX_QUEUE_DELAY_MICROSECONDS}
@@ -53,7 +53,7 @@ fi
 
 if [ $stage -le 3 ] && [ $stop_stage -ge 3 ]; then
     echo "Starting Triton server"
-    tritonserver --model-repository ${model_repo}
+    tritonserver --model-repository ${model_repo} --http-max-header-size=32768000 --http-max-request-size-bytes=32768000
 fi
 
 
