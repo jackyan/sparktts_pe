@@ -733,7 +733,7 @@ class TritonPythonModel:
                 self.logger.info(f"Semantic token IDs shape: {semantic_tokens.shape}")
                 
                 # 预处理文本，决定是否分段并进行分段
-                segments = preprocess_text(target_text, min_segment_length=50, max_segment_length=80, logger=self.logger)
+                segments = self.preprocess_text(target_text, min_segment_length=50, max_segment_length=80, logger=self.logger)
                 
                 # 处理所有段落并获取合并后的音频
                 audio = self.process_text_segments(segments, reference_text, global_tokens, semantic_tokens)
