@@ -172,4 +172,5 @@ cython_debug/
 
 # PyPI configuration file
 .pypirc
-runtime/triton_trtllm/output_grpc_merge_splite_nature_nooverlap_ffmpeg0_1_2.wav
+runtime/triton_trtllm/*.wav
+example/results

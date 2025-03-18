@@ -110,15 +110,25 @@ class TritonPythonModel:
         Args:
             args: Dictionary containing model configuration
         """
+        # 创建日志文件
+        import datetime
+        self.log_file = f"/workspace/sparktts_debug_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+        with open(self.log_file, "w") as f:
+            f.write(f"[{datetime.datetime.now()}] 初始化模型...\n")
         # Parse model parameters
         parameters = json.loads(args['model_config'])['parameters']
         model_params = {k: v["string_value"] for k, v in parameters.items()}
         
+        # 记录模型参数
+        with open(self.log_file, "a") as f:
+            f.write(f"[{datetime.datetime.now()}] 模型参数: {model_params}\n")
         # Initialize tokenizer
         llm_tokenizer_dir = model_params["llm_tokenizer_dir"]
         self.tokenizer = AutoTokenizer.from_pretrained(llm_tokenizer_dir)
         self.device = torch.device("cuda")
         self.decoupled = False
+        with open(self.log_file, "a") as f:
+            f.write(f"[{datetime.datetime.now()}] 模型初始化完成，使用设备: {self.device}\n")
 
     def forward_llm(self, input_ids):
         """
@@ -246,8 +256,104 @@ class TritonPythonModel:
         waveform = torch.utils.dlpack.from_dlpack(waveform.to_dlpack()).cpu()
         
         return waveform
-        
+
     def execute(self, requests):
+        """Execute inference on the batched requests.
+        
+        Args:
+            requests: List of inference requests
+            
+        Returns:
+            List of inference responses containing generated audio
+        """
+        import datetime
+        responses = []
+        
+        with open(self.log_file, "a") as f:
+            f.write(f"[{datetime.datetime.now()}] 收到请求数量: {len(requests)}\n")
+        
+        for request_idx, request in enumerate(requests):
+            with open(self.log_file, "a") as f:
+                f.write(f"[{datetime.datetime.now()}] 处理请求 {request_idx+1}/{len(requests)}\n")
+            
+            # Extract input tensors
+            wav = pb_utils.get_input_tensor_by_name(request, "reference_wav")
+            wav_len = pb_utils.get_input_tensor_by_name(request, "reference_wav_len")
+            
+            # Process reference audio through audio tokenizer
+            global_tokens, semantic_tokens = self.forward_audio_tokenizer(wav, wav_len)
+            
+            # Extract text inputs
+            reference_text = pb_utils.get_input_tensor_by_name(request, "reference_text").as_numpy()
+            reference_text = reference_text[0][0].decode('utf-8')
+            
+            target_text = pb_utils.get_input_tensor_by_name(request, "target_text").as_numpy()
+            target_text = target_text[0][0].decode('utf-8')
+            
+            with open(self.log_file, "a") as f:
+                f.write(f"[{datetime.datetime.now()}] 参考文本: {reference_text}\n")
+                f.write(f"[{datetime.datetime.now()}] 目标文本: {target_text}\n")
+                f.write(f"[{datetime.datetime.now()}] 目标文本长度: {len(target_text)}\n")
+                f.write(f"[{datetime.datetime.now()}] Global token IDs shape: {global_tokens.shape}\n")
+                f.write(f"[{datetime.datetime.now()}] Semantic token IDs shape: {semantic_tokens.shape}\n")
+            
+            # Prepare prompt for LLM
+            prompt, global_token_ids = process_prompt(
+                text=target_text,
+                prompt_text=reference_text,
+                global_token_ids=global_tokens,
+                semantic_token_ids=semantic_tokens,
+            )
+            
+            with open(self.log_file, "a") as f:
+                f.write(f"[{datetime.datetime.now()}] 拼接后的输入长度: {len(prompt)}\n")
+                f.write(f"[{datetime.datetime.now()}] 拼接后的输入前100个字符: {prompt[:100]}...\n")
+                if len(prompt) > 200:
+                    f.write(f"[{datetime.datetime.now()}] 拼接后的输入后100个字符: ...{prompt[-100:]}\n")
+            
+            # Tokenize prompt for LLM
+            model_inputs = self.tokenizer([prompt], return_tensors="pt").to(self.device)
+            input_ids = model_inputs.input_ids.to(torch.int32)
+            
+            with open(self.log_file, "a") as f:
+                f.write(f"[{datetime.datetime.now()}] 分词后的输入token数量: {input_ids.shape[1]}\n")
+            
+            # Generate semantic tokens with LLM
+            generated_ids = self.forward_llm(input_ids)
+            
+            # Decode and extract semantic token IDs from generated text
+            predicted_text = self.tokenizer.batch_decode([generated_ids], skip_special_tokens=True)[0]
+            
+            with open(self.log_file, "a") as f:
+                f.write(f"[{datetime.datetime.now()}] 生成文本长度: {len(predicted_text)}\n")
+                f.write(f"[{datetime.datetime.now()}] 生成文本前100个字符: {predicted_text[:100]}...\n")
+            
+            pred_semantic_ids = (
+                torch.tensor([int(token) for token in re.findall(r"bicodec_semantic_(\d+)", predicted_text)])
+                .unsqueeze(0).to(torch.int32)
+            )
+            
+            with open(self.log_file, "a") as f:
+                f.write(f"[{datetime.datetime.now()}] 提取的语义token数量: {pred_semantic_ids.shape[1]}\n")
+            
+
+            # Generate audio with vocoder
+            audio = self.forward_vocoder(
+                global_token_ids.to(self.device),
+                pred_semantic_ids.to(self.device),
+            )
+            
+            # Prepare response
+            audio_tensor = pb_utils.Tensor.from_dlpack("waveform", to_dlpack(audio))
+            inference_response = pb_utils.InferenceResponse(output_tensors=[audio_tensor])
+            responses.append(inference_response)
+            
+            with open(self.log_file, "a") as f:
+                f.write(f"[{datetime.datetime.now()}] 请求 {request_idx+1} 处理完成\n")
+                             
+        return responses
+            
+    def execute_orig(self, requests):
         """Execute inference on the batched requests.
         
         Args:
