@@ -377,7 +377,7 @@ class TritonPythonModel:
         
         return waveform
 
-    def preprocess_text(self, text, min_segment_length=50, max_segment_length=80, logger=None):
+    def preprocess_text(self, text, min_segment_length=80, max_segment_length=120, logger=None):
         """
         预处理文本，根据文本长度决定是否分段并进行分段处理
         
@@ -392,11 +392,11 @@ class TritonPythonModel:
         """
         # 如果没有提供logger，创建一个新的
         if logger is None:
-            log_file = f"./sparktts_debug_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+            log_file = f"/workspace/sparktts_debug_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
             logger = setup_logger('sparktts', log_file)
         
         # 判断是否需要分段处理
-        need_split = len(text) > 100
+        need_split = len(text) > 130
         
         if not need_split:
             # 不需要分段，将整个文本作为一个段落处理
