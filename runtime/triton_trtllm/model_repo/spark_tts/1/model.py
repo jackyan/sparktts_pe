@@ -456,7 +456,7 @@ class TritonPythonModel:
                         f.write(f"[{datetime.datetime.now()}] 段落{i+1}提取的语义token数量: {pred_semantic_ids.shape[1]}\n")
                     
                     # Generate audio with vocoder
-                    segment_audio = self.forward_vocoder_with_log(
+                    segment_audio = self.forward_vocoder(
                         global_token_ids.to(self.device),
                         pred_semantic_ids.to(self.device),
                     )
@@ -516,7 +516,7 @@ class TritonPythonModel:
                     f.write(f"[{datetime.datetime.now()}] 提取的语义token数量: {pred_semantic_ids.shape[1]}\n")
                 
                 # Generate audio with vocoder
-                audio = self.forward_vocoder_with_log(
+                audio = self.forward_vocoder(
                     global_token_ids.to(self.device),
                     pred_semantic_ids.to(self.device),
                 )
