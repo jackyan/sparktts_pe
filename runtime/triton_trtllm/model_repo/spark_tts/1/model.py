@@ -593,174 +593,174 @@ class TritonPythonModel:
         
         return final_segments
 
-def process_text_segment(self, segment, reference_text, global_tokens, semantic_tokens, segment_index, total_segments):
-    """
-    处理单个文本段落，生成对应的音频
-    
-    Args:
-        segment: 要处理的文本段落
-        reference_text: 参考文本，仅在第一段使用
-        global_tokens: 全局token
-        semantic_tokens: 语义token
-        segment_index: 当前段落索引
-        total_segments: 总段落数
+    def process_text_segment(self, segment, reference_text, global_tokens, semantic_tokens, segment_index, total_segments):
+        """
+        处理单个文本段落，生成对应的音频
         
-    Returns:
-        生成的音频段落，处理失败时返回None
-    """
-    try:
-        self.logger.info(f"处理段落 {segment_index+1}/{total_segments}: {segment}")
-        
-        # 处理当前段落
-        prompt, global_token_ids = process_prompt(
-            text=segment,
-            prompt_text=reference_text if segment_index == 0 else None,  # 只在第一段使用参考文本
-            global_token_ids=global_tokens,
-            semantic_token_ids=semantic_tokens,
-        )
-        
-        self.logger.info(f"段落{segment_index+1}拼接后的输入长度: {len(prompt)}")
-        
-        # Tokenize prompt for LLM
-        model_inputs = self.tokenizer([prompt], return_tensors="pt").to(self.device)
-        input_ids = model_inputs.input_ids.to(torch.int32)
-        
-        self.logger.info(f"段落{segment_index+1}分词后的输入token数量: {input_ids.shape[1]}")
-        
-        # Generate semantic tokens with LLM
-        generated_ids = self.forward_llm(input_ids)
-        
-        # Decode and extract semantic token IDs from generated text
-        predicted_text = self.tokenizer.batch_decode([generated_ids], skip_special_tokens=True)[0]
-        
-        self.logger.info(f"段落{segment_index+1}生成文本长度: {len(predicted_text)}")
-        
-        pred_semantic_ids = (
-            torch.tensor([int(token) for token in re.findall(r"bicodec_semantic_(\d+)", predicted_text)])
-            .unsqueeze(0).to(torch.int32)
-        )
-        
-        self.logger.info(f"段落{segment_index+1}提取的语义token数量: {pred_semantic_ids.shape[1]}")
-        
-        # 生成音频
-        segment_audio = self.forward_vocoder(
-            global_token_ids.to(self.device),
-            pred_semantic_ids.to(self.device),
-        )
-        
-        self.logger.info(f"段落{segment_index+1}生成的音频shape: {segment_audio.shape}")
-        
-        return segment_audio
-    except Exception as e:
-        # 记录异常信息
-        self.logger.error(f"处理段落{segment_index+1}时发生错误: {str(e)}", exc_info=True)
-        return None
-
-def process_text_segments(self, segments, reference_text, global_tokens, semantic_tokens):
-    """
-    处理所有文本段落并合并结果
-    
-    Args:
-        segments: 文本段落列表
-        reference_text: 参考文本
-        global_tokens: 全局token
-        semantic_tokens: 语义token
-        
-    Returns:
-        合并后的音频，如果所有段落处理失败则返回None
-    """
-    # 处理所有段落并收集结果
-    all_audio_segments = []
-    
-    for i, segment in enumerate(segments):
-        segment_audio = self.process_text_segment(
-            segment, 
-            reference_text,  # 对于单段文本，始终使用参考文本
-            global_tokens, 
-            semantic_tokens, 
-            i, 
-            len(segments)
-        )
-        
-        if segment_audio is not None:
-            all_audio_segments.append(segment_audio)
-    
-    # 处理结果
-    if all_audio_segments:
-        # 如果有多个段落，需要合并
-        if len(all_audio_segments) > 1:
-            self.logger.info(f"合并{len(all_audio_segments)}个音频段落")
-            audio = torch.cat(all_audio_segments, dim=1)
-            self.logger.info(f"合并后的音频shape: {audio.shape}")
-        else:
-            # 只有一个段落，直接使用
-            audio = all_audio_segments[0]
-        
-        return audio
-    else:
-        # 所有段落处理失败
-        self.logger.error("所有文本段落处理失败")
-        return None
-
-def execute(self, requests):
-    """Execute inference on the batched requests."""
-    responses = []
-    
-    self.logger.info(f"收到请求数量: {len(requests)}")
-    
-    for request_idx, request in enumerate(requests):
-        self.logger.info(f"处理请求 {request_idx+1}/{len(requests)}")
-        
+        Args:
+            segment: 要处理的文本段落
+            reference_text: 参考文本，仅在第一段使用
+            global_tokens: 全局token
+            semantic_tokens: 语义token
+            segment_index: 当前段落索引
+            total_segments: 总段落数
+            
+        Returns:
+            生成的音频段落，处理失败时返回None
+        """
         try:
-            # Extract input tensors
-            wav = pb_utils.get_input_tensor_by_name(request, "reference_wav")
-            wav_len = pb_utils.get_input_tensor_by_name(request, "reference_wav_len")
+            self.logger.info(f"处理段落 {segment_index+1}/{total_segments}: {segment}")
             
-            # Process reference audio through audio tokenizer
-            global_tokens, semantic_tokens = self.forward_audio_tokenizer(wav, wav_len)
+            # 处理当前段落
+            prompt, global_token_ids = process_prompt(
+                text=segment,
+                prompt_text=reference_text if segment_index == 0 else None,  # 只在第一段使用参考文本
+                global_token_ids=global_tokens,
+                semantic_token_ids=semantic_tokens,
+            )
             
-            # Extract text inputs
-            reference_text = pb_utils.get_input_tensor_by_name(request, "reference_text").as_numpy()
-            reference_text = reference_text[0][0].decode('utf-8')
+            self.logger.info(f"段落{segment_index+1}拼接后的输入长度: {len(prompt)}")
             
-            target_text = pb_utils.get_input_tensor_by_name(request, "target_text").as_numpy()
-            target_text = target_text[0][0].decode('utf-8')
+            # Tokenize prompt for LLM
+            model_inputs = self.tokenizer([prompt], return_tensors="pt").to(self.device)
+            input_ids = model_inputs.input_ids.to(torch.int32)
             
-            self.logger.info(f"参考文本: {reference_text}")
-            self.logger.info(f"目标文本: {target_text}")
-            self.logger.info(f"目标文本长度: {len(target_text)}")
-            self.logger.info(f"Global token IDs shape: {global_tokens.shape}")
-            self.logger.info(f"Semantic token IDs shape: {semantic_tokens.shape}")
+            self.logger.info(f"段落{segment_index+1}分词后的输入token数量: {input_ids.shape[1]}")
             
-            # 预处理文本，决定是否分段并进行分段
-            segments = preprocess_text(target_text, min_segment_length=50, max_segment_length=80, logger=self.logger)
+            # Generate semantic tokens with LLM
+            generated_ids = self.forward_llm(input_ids)
             
-            # 处理所有段落并获取合并后的音频
-            audio = self.process_text_segments(segments, reference_text, global_tokens, semantic_tokens)
+            # Decode and extract semantic token IDs from generated text
+            predicted_text = self.tokenizer.batch_decode([generated_ids], skip_special_tokens=True)[0]
             
-            # 准备响应
-            if audio is not None:
-                audio_tensor = pb_utils.Tensor.from_dlpack("waveform", to_dlpack(audio))
-                inference_response = pb_utils.InferenceResponse(output_tensors=[audio_tensor])
+            self.logger.info(f"段落{segment_index+1}生成文本长度: {len(predicted_text)}")
+            
+            pred_semantic_ids = (
+                torch.tensor([int(token) for token in re.findall(r"bicodec_semantic_(\d+)", predicted_text)])
+                .unsqueeze(0).to(torch.int32)
+            )
+            
+            self.logger.info(f"段落{segment_index+1}提取的语义token数量: {pred_semantic_ids.shape[1]}")
+            
+            # 生成音频
+            segment_audio = self.forward_vocoder(
+                global_token_ids.to(self.device),
+                pred_semantic_ids.to(self.device),
+            )
+            
+            self.logger.info(f"段落{segment_index+1}生成的音频shape: {segment_audio.shape}")
+            
+            return segment_audio
+        except Exception as e:
+            # 记录异常信息
+            self.logger.error(f"处理段落{segment_index+1}时发生错误: {str(e)}", exc_info=True)
+            return None
+
+    def process_text_segments(self, segments, reference_text, global_tokens, semantic_tokens):
+        """
+        处理所有文本段落并合并结果
+        
+        Args:
+            segments: 文本段落列表
+            reference_text: 参考文本
+            global_tokens: 全局token
+            semantic_tokens: 语义token
+            
+        Returns:
+            合并后的音频，如果所有段落处理失败则返回None
+        """
+        # 处理所有段落并收集结果
+        all_audio_segments = []
+        
+        for i, segment in enumerate(segments):
+            segment_audio = self.process_text_segment(
+                segment, 
+                reference_text,  # 对于单段文本，始终使用参考文本
+                global_tokens, 
+                semantic_tokens, 
+                i, 
+                len(segments)
+            )
+            
+            if segment_audio is not None:
+                all_audio_segments.append(segment_audio)
+        
+        # 处理结果
+        if all_audio_segments:
+            # 如果有多个段落，需要合并
+            if len(all_audio_segments) > 1:
+                self.logger.info(f"合并{len(all_audio_segments)}个音频段落")
+                audio = torch.cat(all_audio_segments, dim=1)
+                self.logger.info(f"合并后的音频shape: {audio.shape}")
             else:
+                # 只有一个段落，直接使用
+                audio = all_audio_segments[0]
+            
+            return audio
+        else:
+            # 所有段落处理失败
+            self.logger.error("所有文本段落处理失败")
+            return None
+
+    def execute(self, requests):
+        """Execute inference on the batched requests."""
+        responses = []
+        
+        self.logger.info(f"收到请求数量: {len(requests)}")
+        
+        for request_idx, request in enumerate(requests):
+            self.logger.info(f"处理请求 {request_idx+1}/{len(requests)}")
+            
+            try:
+                # Extract input tensors
+                wav = pb_utils.get_input_tensor_by_name(request, "reference_wav")
+                wav_len = pb_utils.get_input_tensor_by_name(request, "reference_wav_len")
+                
+                # Process reference audio through audio tokenizer
+                global_tokens, semantic_tokens = self.forward_audio_tokenizer(wav, wav_len)
+                
+                # Extract text inputs
+                reference_text = pb_utils.get_input_tensor_by_name(request, "reference_text").as_numpy()
+                reference_text = reference_text[0][0].decode('utf-8')
+                
+                target_text = pb_utils.get_input_tensor_by_name(request, "target_text").as_numpy()
+                target_text = target_text[0][0].decode('utf-8')
+                
+                self.logger.info(f"参考文本: {reference_text}")
+                self.logger.info(f"目标文本: {target_text}")
+                self.logger.info(f"目标文本长度: {len(target_text)}")
+                self.logger.info(f"Global token IDs shape: {global_tokens.shape}")
+                self.logger.info(f"Semantic token IDs shape: {semantic_tokens.shape}")
+                
+                # 预处理文本，决定是否分段并进行分段
+                segments = preprocess_text(target_text, min_segment_length=50, max_segment_length=80, logger=self.logger)
+                
+                # 处理所有段落并获取合并后的音频
+                audio = self.process_text_segments(segments, reference_text, global_tokens, semantic_tokens)
+                
+                # 准备响应
+                if audio is not None:
+                    audio_tensor = pb_utils.Tensor.from_dlpack("waveform", to_dlpack(audio))
+                    inference_response = pb_utils.InferenceResponse(output_tensors=[audio_tensor])
+                else:
+                    inference_response = pb_utils.InferenceResponse(
+                        output_tensors=[],
+                        error=pb_utils.TritonError("所有文本段落处理失败")
+                    )
+                    
+                responses.append(inference_response)
+                self.logger.info(f"请求 {request_idx+1} 处理完成")
+            
+            except Exception as e:
+                # 处理整个请求的异常
+                self.logger.error(f"处理请求 {request_idx+1} 时发生错误: {str(e)}", exc_info=True)
                 inference_response = pb_utils.InferenceResponse(
                     output_tensors=[],
-                    error=pb_utils.TritonError("所有文本段落处理失败")
+                    error=pb_utils.TritonError(f"处理请求失败: {str(e)}")
                 )
-                
-            responses.append(inference_response)
-            self.logger.info(f"请求 {request_idx+1} 处理完成")
-        
-        except Exception as e:
-            # 处理整个请求的异常
-            self.logger.error(f"处理请求 {request_idx+1} 时发生错误: {str(e)}", exc_info=True)
-            inference_response = pb_utils.InferenceResponse(
-                output_tensors=[],
-                error=pb_utils.TritonError(f"处理请求失败: {str(e)}")
-            )
-            responses.append(inference_response)
-                     
-    return responses
+                responses.append(inference_response)
+                        
+        return responses
 
     def execute_backup(self, requests):
         """Execute inference on the batched requests."""
