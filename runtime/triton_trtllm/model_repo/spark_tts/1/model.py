@@ -376,8 +376,393 @@ class TritonPythonModel:
         waveform = torch.utils.dlpack.from_dlpack(waveform.to_dlpack()).cpu()
         
         return waveform
+
+    def preprocess_text(self, text, min_segment_length=50, max_segment_length=80, logger=None):
+        """
+        预处理文本，根据文本长度决定是否分段并进行分段处理
         
-    def execute(self, requests):
+        Args:
+            text: 需要处理的文本
+            min_segment_length: 分段的最小长度
+            max_segment_length: 强制分割时的最大段落长度
+            logger: 日志记录器
+            
+        Returns:
+            分割后的文本段落列表
+        """
+        # 如果没有提供logger，创建一个新的
+        if logger is None:
+            log_file = f"./sparktts_debug_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+            logger = setup_logger('sparktts', log_file)
+        
+        # 判断是否需要分段处理
+        need_split = len(text) > 100
+        
+        if not need_split:
+            # 不需要分段，将整个文本作为一个段落处理
+            logger.info("文本长度适中，不需要分段处理")
+            return [text]
+        
+        logger.info(f"目标文本长度为{len(text)}字符，进行分段处理")
+        
+        # 第一步：按空行分割成段落
+        # 匹配一个或多个空行（包含可能的空格和制表符）
+        paragraphs = re.split(r'\n\s*\n', text)
+        paragraphs = [p.strip() for p in paragraphs if p.strip()]  # 移除空段落
+        
+        logger.info(f"按空行分割成{len(paragraphs)}个段落")
+        for i, para in enumerate(paragraphs):
+            logger.info(f"原始段落{i+1}: {para[:50]}{'...' if len(para) > 50 else ''}")
+        
+        # 如果没有找到多个段落，则整个文本作为一个段落
+        if len(paragraphs) <= 1:
+            paragraphs = [text]
+            logger.info("未检测到多个段落，将整个文本视为一个段落")
+        
+        # 更完备的中文和英文标点符号列表
+        punctuations = [
+            '，', '。', '！', '？', '；', '：', '、', '…', '"', '"', ''', ''', '【', '】', '《', '》', '（', '）',
+            ',', '.', '!', '?', ';', ':', '...', '"', "'", '(', ')', '[', ']', '{', '}', '<', '>'
+        ]
+        
+        # 优先级排序的标点符号（句号、问号、感叹号优先级高）
+        priority_puncts = ['。', '！', '？', '.', '!', '?']
+        secondary_puncts = ['；', '，', ';', ',']
+        
+        # 第二步：对每个段落进行进一步分割
+        final_segments = []
+        
+        for para_idx, paragraph in enumerate(paragraphs):
+            # 如果段落长度小于最小分段长度的2倍，则不再分割
+            if len(paragraph) < min_segment_length * 2:
+                logger.info(f"段落{para_idx+1}长度为{len(paragraph)}字符，小于最小分段长度的2倍，保持完整")
+                final_segments.append(paragraph)
+                continue
+            
+            # 找到段落中所有可能的分割点
+            potential_splits = []
+            
+            for i, char in enumerate(paragraph):
+                if char in punctuations and i >= min_segment_length - 1:
+                    # 根据标点符号类型分配优先级
+                    priority = 1 if char in priority_puncts else (2 if char in secondary_puncts else 3)
+                    potential_splits.append((i, priority))
+            
+            # 如果没有找到任何潜在分割点，则使用强制分割
+            if not potential_splits:
+                para_segments = []
+                for i in range(0, len(paragraph), max_segment_length):
+                    para_segments.append(paragraph[i:min(i+max_segment_length, len(paragraph))])
+                
+                final_segments.extend(para_segments)
+                
+                logger.info(f"段落{para_idx+1}未找到合适的分割点，使用强制分割，共{len(para_segments)}段")
+                continue
+            
+            # 对分割点进行优化：尽量均匀分布，同时考虑标点符号优先级
+            para_segments = []
+            last_split = -1
+            target_length = (len(paragraph) // (len(potential_splits) // 2 + 1)) if len(potential_splits) > 1 else max_segment_length
+            target_length = min(max(target_length, min_segment_length), max_segment_length)
+            
+            logger.info(f"段落{para_idx+1}目标分段长度: {target_length}字符")
+            
+            # 按位置排序分割点
+            potential_splits.sort(key=lambda x: x[0])
+            
+            # 防止死循环，设置最大迭代次数
+            max_iterations = len(potential_splits) + 10
+            iteration_count = 0
+            
+            while last_split < len(paragraph) - 1 and iteration_count < max_iterations:
+                iteration_count += 1
+                
+                # 找出当前位置之后的最佳分割点
+                best_split = None
+                best_score = float('inf')
+                
+                for pos, priority in potential_splits:
+                    if pos <= last_split:
+                        continue
+                        
+                    # 计算与目标长度的差距，并考虑标点符号优先级
+                    segment_length = pos - last_split
+                    if segment_length < min_segment_length:
+                        continue
+                        
+                    # 分数越低越好：长度接近目标长度，优先级高的标点符号
+                    score = abs(segment_length - target_length) * priority
+                    
+                    if score < best_score:
+                        best_score = score
+                        best_split = pos
+                
+                # 如果找不到合适的分割点，或者剩余文本不长，则将剩余文本作为最后一段
+                if best_split is None:
+                    # 如果找不到合适的分割点，但剩余文本较长，则强制分割
+                    remaining_text = paragraph[last_split+1:]
+                    if len(remaining_text) > max_segment_length * 1.5:
+                        # 强制分割剩余文本
+                        for i in range(0, len(remaining_text), max_segment_length):
+                            para_segments.append(remaining_text[i:min(i+max_segment_length, len(remaining_text))])
+                        logger.info(f"段落{para_idx+1}剩余文本({len(remaining_text)}字符)较长，进行强制分割")
+                    else:
+                        para_segments.append(remaining_text)
+                        logger.info(f"段落{para_idx+1}剩余文本({len(remaining_text)}字符)作为最后一段")
+                    break
+                
+                # 添加分割出的段落
+                para_segments.append(paragraph[last_split+1:best_split+1])
+                last_split = best_split
+                
+                # 检查是否已经处理到文本末尾
+                if last_split >= len(paragraph) - min_segment_length:
+                    # 如果剩余文本较短，直接添加到最后一个段落
+                    if last_split < len(paragraph) - 1:
+                        para_segments[-1] += paragraph[last_split+1:]
+                        logger.info(f"段落{para_idx+1}剩余文本较短，合并到最后一段")
+                    break
+            
+            # 如果迭代达到最大次数但仍未处理完文本，强制处理剩余部分
+            if iteration_count >= max_iterations and last_split < len(paragraph) - 1:
+                remaining_text = paragraph[last_split+1:]
+                logger.warning(f"段落{para_idx+1}处理达到最大迭代次数，强制处理剩余文本({len(remaining_text)}字符)")
+                
+                # 强制分割剩余文本
+                for i in range(0, len(remaining_text), max_segment_length):
+                    para_segments.append(remaining_text[i:min(i+max_segment_length, len(remaining_text))])
+            
+            # 处理最后可能的空段落
+            para_segments = [seg for seg in para_segments if seg]
+            
+            logger.info(f"段落{para_idx+1}被分为{len(para_segments)}个子段落")
+            for i, seg in enumerate(para_segments):
+                logger.info(f"  子段落{i+1}: {seg[:30]}...({len(seg)}字符)")
+            
+            # 检查是否有过长的段落需要强制分割
+            for segment in para_segments:
+                if len(segment) > max_segment_length * 1.5:  # 如果段落长度超过最大长度的1.5倍
+                    # 强制分割过长段落
+                    logger.info(f"检测到过长段落({len(segment)}字符)，进行强制分割")
+                    for i in range(0, len(segment), max_segment_length):
+                        final_segments.append(segment[i:min(i+max_segment_length, len(segment))])
+                else:
+                    final_segments.append(segment)
+        
+        # 最终检查：确保所有段落都不为空且长度合适
+        final_segments = [seg for seg in final_segments if seg and len(seg.strip()) > 0]
+        
+        # 智能合并过短的段落
+        if len(final_segments) > 1:
+            logger.info("开始智能合并过短段落")
+            merged_segments = []
+            current_segment = final_segments[0]
+            
+            for i in range(1, len(final_segments)):
+                # 如果当前段落和下一个段落合并后长度不超过最大长度，则合并
+                if len(current_segment) + len(final_segments[i]) <= max_segment_length:
+                    # 检查是否需要添加标点符号连接
+                    if not current_segment[-1] in punctuations:
+                        logger.info(f"合并段落 '{current_segment[-10:]}' 和 '{final_segments[i][:10]}...'，添加逗号连接")
+                        current_segment += "，" + final_segments[i]  # 使用逗号连接
+                    else:
+                        logger.info(f"合并段落 '{current_segment[-10:]}' 和 '{final_segments[i][:10]}...'")
+                        current_segment += final_segments[i]
+                else:
+                    merged_segments.append(current_segment)
+                    current_segment = final_segments[i]
+            
+            # 添加最后一个段落
+            merged_segments.append(current_segment)
+            final_segments = merged_segments
+            
+            logger.info(f"智能合并后，段落数量从{len(final_segments)}减少到{len(merged_segments)}")
+        
+        # 确保至少返回一个段落
+        if not final_segments:
+            # 如果所有处理后没有得到有效段落，则使用简单的强制分割
+            final_segments = []
+            for i in range(0, len(text), max_segment_length):
+                final_segments.append(text[i:min(i+max_segment_length, len(text))])
+            
+            logger.warning(f"分段处理未产生有效段落，使用强制分割，共{len(final_segments)}段")
+        
+        logger.info(f"最终文本被分为{len(final_segments)}段")
+        for i, seg in enumerate(final_segments):
+            logger.info(f"最终段落{i+1}({len(seg)}字符): {seg}")
+        
+        return final_segments
+
+def process_text_segment(self, segment, reference_text, global_tokens, semantic_tokens, segment_index, total_segments):
+    """
+    处理单个文本段落，生成对应的音频
+    
+    Args:
+        segment: 要处理的文本段落
+        reference_text: 参考文本，仅在第一段使用
+        global_tokens: 全局token
+        semantic_tokens: 语义token
+        segment_index: 当前段落索引
+        total_segments: 总段落数
+        
+    Returns:
+        生成的音频段落，处理失败时返回None
+    """
+    try:
+        self.logger.info(f"处理段落 {segment_index+1}/{total_segments}: {segment}")
+        
+        # 处理当前段落
+        prompt, global_token_ids = process_prompt(
+            text=segment,
+            prompt_text=reference_text if segment_index == 0 else None,  # 只在第一段使用参考文本
+            global_token_ids=global_tokens,
+            semantic_token_ids=semantic_tokens,
+        )
+        
+        self.logger.info(f"段落{segment_index+1}拼接后的输入长度: {len(prompt)}")
+        
+        # Tokenize prompt for LLM
+        model_inputs = self.tokenizer([prompt], return_tensors="pt").to(self.device)
+        input_ids = model_inputs.input_ids.to(torch.int32)
+        
+        self.logger.info(f"段落{segment_index+1}分词后的输入token数量: {input_ids.shape[1]}")
+        
+        # Generate semantic tokens with LLM
+        generated_ids = self.forward_llm(input_ids)
+        
+        # Decode and extract semantic token IDs from generated text
+        predicted_text = self.tokenizer.batch_decode([generated_ids], skip_special_tokens=True)[0]
+        
+        self.logger.info(f"段落{segment_index+1}生成文本长度: {len(predicted_text)}")
+        
+        pred_semantic_ids = (
+            torch.tensor([int(token) for token in re.findall(r"bicodec_semantic_(\d+)", predicted_text)])
+            .unsqueeze(0).to(torch.int32)
+        )
+        
+        self.logger.info(f"段落{segment_index+1}提取的语义token数量: {pred_semantic_ids.shape[1]}")
+        
+        # 生成音频
+        segment_audio = self.forward_vocoder(
+            global_token_ids.to(self.device),
+            pred_semantic_ids.to(self.device),
+        )
+        
+        self.logger.info(f"段落{segment_index+1}生成的音频shape: {segment_audio.shape}")
+        
+        return segment_audio
+    except Exception as e:
+        # 记录异常信息
+        self.logger.error(f"处理段落{segment_index+1}时发生错误: {str(e)}", exc_info=True)
+        return None
+
+def process_text_segments(self, segments, reference_text, global_tokens, semantic_tokens):
+    """
+    处理所有文本段落并合并结果
+    
+    Args:
+        segments: 文本段落列表
+        reference_text: 参考文本
+        global_tokens: 全局token
+        semantic_tokens: 语义token
+        
+    Returns:
+        合并后的音频，如果所有段落处理失败则返回None
+    """
+    # 处理所有段落并收集结果
+    all_audio_segments = []
+    
+    for i, segment in enumerate(segments):
+        segment_audio = self.process_text_segment(
+            segment, 
+            reference_text,  # 对于单段文本，始终使用参考文本
+            global_tokens, 
+            semantic_tokens, 
+            i, 
+            len(segments)
+        )
+        
+        if segment_audio is not None:
+            all_audio_segments.append(segment_audio)
+    
+    # 处理结果
+    if all_audio_segments:
+        # 如果有多个段落，需要合并
+        if len(all_audio_segments) > 1:
+            self.logger.info(f"合并{len(all_audio_segments)}个音频段落")
+            audio = torch.cat(all_audio_segments, dim=1)
+            self.logger.info(f"合并后的音频shape: {audio.shape}")
+        else:
+            # 只有一个段落，直接使用
+            audio = all_audio_segments[0]
+        
+        return audio
+    else:
+        # 所有段落处理失败
+        self.logger.error("所有文本段落处理失败")
+        return None
+
+def execute(self, requests):
+    """Execute inference on the batched requests."""
+    responses = []
+    
+    self.logger.info(f"收到请求数量: {len(requests)}")
+    
+    for request_idx, request in enumerate(requests):
+        self.logger.info(f"处理请求 {request_idx+1}/{len(requests)}")
+        
+        try:
+            # Extract input tensors
+            wav = pb_utils.get_input_tensor_by_name(request, "reference_wav")
+            wav_len = pb_utils.get_input_tensor_by_name(request, "reference_wav_len")
+            
+            # Process reference audio through audio tokenizer
+            global_tokens, semantic_tokens = self.forward_audio_tokenizer(wav, wav_len)
+            
+            # Extract text inputs
+            reference_text = pb_utils.get_input_tensor_by_name(request, "reference_text").as_numpy()
+            reference_text = reference_text[0][0].decode('utf-8')
+            
+            target_text = pb_utils.get_input_tensor_by_name(request, "target_text").as_numpy()
+            target_text = target_text[0][0].decode('utf-8')
+            
+            self.logger.info(f"参考文本: {reference_text}")
+            self.logger.info(f"目标文本: {target_text}")
+            self.logger.info(f"目标文本长度: {len(target_text)}")
+            self.logger.info(f"Global token IDs shape: {global_tokens.shape}")
+            self.logger.info(f"Semantic token IDs shape: {semantic_tokens.shape}")
+            
+            # 预处理文本，决定是否分段并进行分段
+            segments = preprocess_text(target_text, min_segment_length=50, max_segment_length=80, logger=self.logger)
+            
+            # 处理所有段落并获取合并后的音频
+            audio = self.process_text_segments(segments, reference_text, global_tokens, semantic_tokens)
+            
+            # 准备响应
+            if audio is not None:
+                audio_tensor = pb_utils.Tensor.from_dlpack("waveform", to_dlpack(audio))
+                inference_response = pb_utils.InferenceResponse(output_tensors=[audio_tensor])
+            else:
+                inference_response = pb_utils.InferenceResponse(
+                    output_tensors=[],
+                    error=pb_utils.TritonError("所有文本段落处理失败")
+                )
+                
+            responses.append(inference_response)
+            self.logger.info(f"请求 {request_idx+1} 处理完成")
+        
+        except Exception as e:
+            # 处理整个请求的异常
+            self.logger.error(f"处理请求 {request_idx+1} 时发生错误: {str(e)}", exc_info=True)
+            inference_response = pb_utils.InferenceResponse(
+                output_tensors=[],
+                error=pb_utils.TritonError(f"处理请求失败: {str(e)}")
+            )
+            responses.append(inference_response)
+                     
+    return responses
+
+    def execute_backup(self, requests):
         """Execute inference on the batched requests."""
         responses = []
         
@@ -413,7 +798,7 @@ class TritonPythonModel:
                 # 按标点符号分段
                 segments = []
                 current_segment = ""
-                punctuations = ['，', '。', '！', '？', '；', '：', ',', '.', '!', '?', ';', ':']
+                punctuations = ['，', '。', '！', '？', '；', '：', ',', '!', '?', ';', ':']
                 
                 for char in target_text:
                     current_segment += char
