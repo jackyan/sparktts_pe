@@ -157,7 +157,7 @@ class TritonPythonModel:
         """
         # convert input_ids to numpy, with shape [1, sequence_length]
         input_ids = input_ids.cpu().numpy()
-        max_tokens = 512
+        max_tokens = 5120
         input_dict = {
             "request_output_len": np.array([[max_tokens]], dtype=np.int32),
             "end_id": np.array([[self.tokenizer.eos_token_id]], dtype=np.int32),
@@ -352,7 +352,7 @@ class TritonPythonModel:
                 f.write(f"[{datetime.datetime.now()}] 请求 {request_idx+1} 处理完成\n")
                              
         return responses
-            
+
     def execute_orig(self, requests):
         """Execute inference on the batched requests.
         
