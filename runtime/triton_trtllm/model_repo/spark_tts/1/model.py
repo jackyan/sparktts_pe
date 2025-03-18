@@ -225,8 +225,93 @@ class TritonPythonModel:
         semantic_tokens = torch.utils.dlpack.from_dlpack(semantic_tokens.to_dlpack()).cpu()
         
         return global_tokens, semantic_tokens
-
+        
     def forward_vocoder(self, global_token_ids: torch.Tensor, pred_semantic_ids: torch.Tensor) -> torch.Tensor:
+        """Forward pass through the vocoder component."""
+        import datetime
+        
+        with open(self.log_file, "a") as f:
+            f.write(f"[{datetime.datetime.now()}] Vocoder输入 - global_token_ids shape: {global_token_ids.shape}\n")
+            f.write(f"[{datetime.datetime.now()}] Vocoder输入 - pred_semantic_ids shape: {pred_semantic_ids.shape}\n")
+            if pred_semantic_ids.shape[1] > 1000:
+                f.write(f"[{datetime.datetime.now()}] 警告: 语义token数量较大，可能超出vocoder处理能力\n")
+                # 记录前10个和后10个语义token，检查是否有重复模式
+                f.write(f"[{datetime.datetime.now()}] 前10个语义token: {pred_semantic_ids[0, :10].tolist()}\n")
+                f.write(f"[{datetime.datetime.now()}] 后10个语义token: {pred_semantic_ids[0, -10:].tolist()}\n")
+        
+        # 尝试分段处理长语义序列
+        max_segment_length = 800  # 设置一个合理的分段长度
+        if pred_semantic_ids.shape[1] > max_segment_length:
+            with open(self.log_file, "a") as f:
+                f.write(f"[{datetime.datetime.now()}] 语义token数量({pred_semantic_ids.shape[1]})超过{max_segment_length}，尝试分段处理\n")
+            
+            # 分段处理
+            segments = []
+            for i in range(0, pred_semantic_ids.shape[1], max_segment_length):
+                end_idx = min(i + max_segment_length, pred_semantic_ids.shape[1])
+                segment = pred_semantic_ids[:, i:end_idx]
+                
+                # 为每个段落创建输入张量
+                global_token_ids_tensor = pb_utils.Tensor.from_dlpack("global_tokens", to_dlpack(global_token_ids))
+                segment_tensor = pb_utils.Tensor.from_dlpack("semantic_tokens", to_dlpack(segment))
+                
+                # 处理当前段落
+                inference_request = pb_utils.InferenceRequest(
+                    model_name='vocoder',
+                    requested_output_names=['waveform'],
+                    inputs=[global_token_ids_tensor, segment_tensor]
+                )
+                
+                inference_response = inference_request.exec()
+                if inference_response.has_error():
+                    with open(self.log_file, "a") as f:
+                        f.write(f"[{datetime.datetime.now()}] 段落处理错误: {inference_response.error().message()}\n")
+                    continue
+                
+                # 提取当前段落的波形
+                segment_waveform = pb_utils.get_output_tensor_by_name(inference_response, 'waveform')
+                segment_waveform = torch.utils.dlpack.from_dlpack(segment_waveform.to_dlpack()).cpu()
+                segments.append(segment_waveform)
+                
+                with open(self.log_file, "a") as f:
+                    f.write(f"[{datetime.datetime.now()}] 段落 {i//max_segment_length + 1} 处理完成，波形shape: {segment_waveform.shape}\n")
+            
+            # 合并所有段落
+            if segments:
+                waveform = torch.cat(segments, dim=1)
+                with open(self.log_file, "a") as f:
+                    f.write(f"[{datetime.datetime.now()}] 合并后的波形shape: {waveform.shape}\n")
+                return waveform
+            else:
+                with open(self.log_file, "a") as f:
+                    f.write(f"[{datetime.datetime.now()}] 所有段落处理失败，尝试使用原始方法\n")
+        
+        # 原始处理逻辑
+        global_token_ids_tensor = pb_utils.Tensor.from_dlpack("global_tokens", to_dlpack(global_token_ids))
+        pred_semantic_ids_tensor = pb_utils.Tensor.from_dlpack("semantic_tokens", to_dlpack(pred_semantic_ids))
+        
+        inference_request = pb_utils.InferenceRequest(
+            model_name='vocoder',
+            requested_output_names=['waveform'],
+            inputs=[global_token_ids_tensor, pred_semantic_ids_tensor]
+        )
+        
+        inference_response = inference_request.exec()
+        if inference_response.has_error():
+            error_msg = inference_response.error().message()
+            with open(self.log_file, "a") as f:
+                f.write(f"[{datetime.datetime.now()}] Vocoder错误: {error_msg}\n")
+            raise pb_utils.TritonModelException(error_msg)
+        
+        waveform = pb_utils.get_output_tensor_by_name(inference_response, 'waveform')
+        waveform = torch.utils.dlpack.from_dlpack(waveform.to_dlpack()).cpu()
+        
+        with open(self.log_file, "a") as f:
+            f.write(f"[{datetime.datetime.now()}] Vocoder输出 - waveform shape: {waveform.shape}\n")
+        
+        return waveform
+    
+    def forward_vocoder_orig(self, global_token_ids: torch.Tensor, pred_semantic_ids: torch.Tensor) -> torch.Tensor:
         """Forward pass through the vocoder component.
         
         Args:
