@@ -1,4 +1,4 @@
-export PYTHONPATH=../../../Spark-TTS/
+export PYTHONPATH=../../../sparktts_pe/
 export CUDA_VISIBLE_DEVICES=0
 stage=$1
 stop_stage=$2
