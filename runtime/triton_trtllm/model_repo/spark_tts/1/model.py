@@ -27,6 +27,8 @@
 import json
 import os
 import re
+import logging
+import datetime
 from typing import Dict, List, Tuple, Optional, Union
 
 import numpy as np
@@ -36,6 +38,19 @@ import triton_python_backend_utils as pb_utils
 from transformers import AutoTokenizer
 
 from sparktts.utils.token_parser import TASK_TOKEN_MAP
+
+# 设置日志
+def setup_logger(name, log_file, level=logging.INFO):
+    """设置日志记录器"""
+    formatter = logging.Formatter('[%(asctime)s] %(message)s')
+    handler = logging.FileHandler(log_file)
+    handler.setFormatter(formatter)
+    
+    logger = logging.getLogger(name)
+    logger.setLevel(level)
+    logger.addHandler(handler)
+    
+    return logger
 
 def process_prompt(
     text: str,
@@ -103,8 +118,28 @@ class TritonPythonModel:
     This model orchestrates the end-to-end TTS pipeline by coordinating
     between audio tokenizer, LLM, and vocoder components.
     """
-    
     def initialize(self, args):
+        """Initialize the model."""
+        # 创建日志文件和日志记录器
+        log_file = f"/workspace/sparktts_debug_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+        self.logger = setup_logger('sparktts', log_file)
+        self.logger.info("初始化模型...")
+        
+        # Parse model parameters
+        parameters = json.loads(args['model_config'])['parameters']
+        model_params = {k: v["string_value"] for k, v in parameters.items()}
+        
+        # 记录模型参数
+        self.logger.info(f"模型参数: {model_params}")
+        
+        # Initialize tokenizer
+        llm_tokenizer_dir = model_params["llm_tokenizer_dir"]
+        self.tokenizer = AutoTokenizer.from_pretrained(llm_tokenizer_dir)
+        self.device = torch.device("cuda")
+        self.decoupled = False
+        self.logger.info(f"模型初始化完成，使用设备: {self.device}")
+    
+    def initialize_orig(self, args):
         """Initialize the model.
         
         Args:
@@ -341,8 +376,186 @@ class TritonPythonModel:
         waveform = torch.utils.dlpack.from_dlpack(waveform.to_dlpack()).cpu()
         
         return waveform
-
+        
     def execute(self, requests):
+        """Execute inference on the batched requests."""
+        responses = []
+        
+        self.logger.info(f"收到请求数量: {len(requests)}")
+        
+        for request_idx, request in enumerate(requests):
+            self.logger.info(f"处理请求 {request_idx+1}/{len(requests)}")
+            
+            # Extract input tensors
+            wav = pb_utils.get_input_tensor_by_name(request, "reference_wav")
+            wav_len = pb_utils.get_input_tensor_by_name(request, "reference_wav_len")
+            
+            # Process reference audio through audio tokenizer
+            global_tokens, semantic_tokens = self.forward_audio_tokenizer(wav, wav_len)
+            
+            # Extract text inputs
+            reference_text = pb_utils.get_input_tensor_by_name(request, "reference_text").as_numpy()
+            reference_text = reference_text[0][0].decode('utf-8')
+            
+            target_text = pb_utils.get_input_tensor_by_name(request, "target_text").as_numpy()
+            target_text = target_text[0][0].decode('utf-8')
+            
+            self.logger.info(f"参考文本: {reference_text}")
+            self.logger.info(f"目标文本: {target_text}")
+            self.logger.info(f"目标文本长度: {len(target_text)}")
+            self.logger.info(f"Global token IDs shape: {global_tokens.shape}")
+            self.logger.info(f"Semantic token IDs shape: {semantic_tokens.shape}")
+            
+            # 检查文本长度，如果超过100个字符，则分段处理
+            if len(target_text) > 100:
+                self.logger.info("目标文本长度超过100，尝试分段处理")
+                
+                # 按标点符号分段
+                segments = []
+                current_segment = ""
+                punctuations = ['，', '。', '！', '？', '；', '：', ',', '.', '!', '?', ';', ':']
+                
+                for char in target_text:
+                    current_segment += char
+                    if char in punctuations and len(current_segment) >= 50:
+                        segments.append(current_segment)
+                        current_segment = ""
+                
+                # 处理最后一段
+                if current_segment:
+                    segments.append(current_segment)
+                
+                # 如果没有找到合适的分割点，则强制分割
+                if len(segments) <= 1 and len(target_text) > 100:
+                    segments = []
+                    for i in range(0, len(target_text), 80):
+                        segments.append(target_text[i:min(i+80, len(target_text))])
+                
+                self.logger.info(f"文本被分为{len(segments)}段")
+                for i, seg in enumerate(segments):
+                    self.logger.info(f"段落{i+1}: {seg}")
+                
+                # 处理每个段落并合并结果
+                all_audio_segments = []
+                
+                for i, segment in enumerate(segments):
+                    try:  # 添加异常处理
+                        self.logger.info(f"处理段落 {i+1}/{len(segments)}: {segment}")
+                        
+                        # 处理当前段落
+                        prompt, global_token_ids = process_prompt(
+                            text=segment,
+                            prompt_text=reference_text if i == 0 else None,  # 只在第一段使用参考文本
+                            global_token_ids=global_tokens,
+                            semantic_token_ids=semantic_tokens,
+                        )
+                        
+                        self.logger.info(f"段落{i+1}拼接后的输入长度: {len(prompt)}")
+                        
+                        # Tokenize prompt for LLM
+                        model_inputs = self.tokenizer([prompt], return_tensors="pt").to(self.device)
+                        input_ids = model_inputs.input_ids.to(torch.int32)
+                        
+                        self.logger.info(f"段落{i+1}分词后的输入token数量: {input_ids.shape[1]}")
+                        
+                        # Generate semantic tokens with LLM
+                        generated_ids = self.forward_llm(input_ids)
+                        
+                        # Decode and extract semantic token IDs from generated text
+                        predicted_text = self.tokenizer.batch_decode([generated_ids], skip_special_tokens=True)[0]
+                        
+                        self.logger.info(f"段落{i+1}生成文本长度: {len(predicted_text)}")
+                        
+                        pred_semantic_ids = (
+                            torch.tensor([int(token) for token in re.findall(r"bicodec_semantic_(\d+)", predicted_text)])
+                            .unsqueeze(0).to(torch.int32)
+                        )
+                        
+                        self.logger.info(f"段落{i+1}提取的语义token数量: {pred_semantic_ids.shape[1]}")
+                        
+                        # 使用正确的vocoder函数
+                        segment_audio = self.forward_vocoder(
+                            global_token_ids.to(self.device),
+                            pred_semantic_ids.to(self.device),
+                        )
+                        
+                        self.logger.info(f"段落{i+1}生成的音频shape: {segment_audio.shape}")
+                        
+                        all_audio_segments.append(segment_audio)
+                    except Exception as e:
+                        # 记录异常信息
+                        self.logger.error(f"处理段落{i+1}时发生错误: {str(e)}", exc_info=True)
+                        continue  # 继续处理下一个段落
+                
+                # 合并所有音频段落
+                if all_audio_segments:
+                    self.logger.info(f"合并{len(all_audio_segments)}个音频段落")
+                    
+                    # 简单拼接音频段落
+                    audio = torch.cat(all_audio_segments, dim=1)
+                    
+                    self.logger.info(f"合并后的音频shape: {audio.shape}")
+                else:
+                    # 如果所有段落处理失败，记录错误并返回空响应
+                    self.logger.error("所有段落处理失败，返回空响应")
+                    inference_response = pb_utils.InferenceResponse(
+                        output_tensors=[],
+                        error=pb_utils.TritonError("所有文本段落处理失败")
+                    )
+                    responses.append(inference_response)
+                    continue
+            else:
+                # 原始处理逻辑，不分段
+                prompt, global_token_ids = process_prompt(
+                    text=target_text,
+                    prompt_text=reference_text,
+                    global_token_ids=global_tokens,
+                    semantic_token_ids=semantic_tokens,
+                )
+                
+                self.logger.info(f"拼接后的输入长度: {len(prompt)}")
+                self.logger.info(f"拼接后的输入前100个字符: {prompt[:100]}...")
+                if len(prompt) > 200:
+                    self.logger.info(f"拼接后的输入后100个字符: ...{prompt[-100:]}")
+                
+                # Tokenize prompt for LLM
+                model_inputs = self.tokenizer([prompt], return_tensors="pt").to(self.device)
+                input_ids = model_inputs.input_ids.to(torch.int32)
+                
+                self.logger.info(f"分词后的输入token数量: {input_ids.shape[1]}")
+                
+                # Generate semantic tokens with LLM
+                generated_ids = self.forward_llm(input_ids)
+                
+                # Decode and extract semantic token IDs from generated text
+                predicted_text = self.tokenizer.batch_decode([generated_ids], skip_special_tokens=True)[0]
+                
+                self.logger.info(f"生成文本长度: {len(predicted_text)}")
+                self.logger.info(f"生成文本前100个字符: {predicted_text[:100]}...")
+                
+                pred_semantic_ids = (
+                    torch.tensor([int(token) for token in re.findall(r"bicodec_semantic_(\d+)", predicted_text)])
+                    .unsqueeze(0).to(torch.int32)
+                )
+                
+                self.logger.info(f"提取的语义token数量: {pred_semantic_ids.shape[1]}")
+                
+                # Generate audio with vocoder
+                audio = self.forward_vocoder(
+                    global_token_ids.to(self.device),
+                    pred_semantic_ids.to(self.device),
+                )
+            
+            # Prepare response
+            audio_tensor = pb_utils.Tensor.from_dlpack("waveform", to_dlpack(audio))
+            inference_response = pb_utils.InferenceResponse(output_tensors=[audio_tensor])
+            responses.append(inference_response)
+            
+            self.logger.info(f"请求 {request_idx+1} 处理完成")
+                         
+        return responses
+
+    def execute_with_file(self, requests):
         """Execute inference on the batched requests.
         
         Args:
