@@ -225,8 +225,8 @@ class TritonPythonModel:
         semantic_tokens = torch.utils.dlpack.from_dlpack(semantic_tokens.to_dlpack()).cpu()
         
         return global_tokens, semantic_tokens
-        
-    def forward_vocoder(self, global_token_ids: torch.Tensor, pred_semantic_ids: torch.Tensor) -> torch.Tensor:
+
+    def forward_vocoder_with_log(self, global_token_ids: torch.Tensor, pred_semantic_ids: torch.Tensor) -> torch.Tensor:
         """Forward pass through the vocoder component."""
         import datetime
         
@@ -311,7 +311,7 @@ class TritonPythonModel:
         
         return waveform
     
-    def forward_vocoder_orig(self, global_token_ids: torch.Tensor, pred_semantic_ids: torch.Tensor) -> torch.Tensor:
+    def forward_vocoder(self, global_token_ids: torch.Tensor, pred_semantic_ids: torch.Tensor) -> torch.Tensor:
         """Forward pass through the vocoder component.
         
         Args:
@@ -382,51 +382,144 @@ class TritonPythonModel:
                 f.write(f"[{datetime.datetime.now()}] Global token IDs shape: {global_tokens.shape}\n")
                 f.write(f"[{datetime.datetime.now()}] Semantic token IDs shape: {semantic_tokens.shape}\n")
             
-            # Prepare prompt for LLM
-            prompt, global_token_ids = process_prompt(
-                text=target_text,
-                prompt_text=reference_text,
-                global_token_ids=global_tokens,
-                semantic_token_ids=semantic_tokens,
-            )
-            
-            with open(self.log_file, "a") as f:
-                f.write(f"[{datetime.datetime.now()}] 拼接后的输入长度: {len(prompt)}\n")
-                f.write(f"[{datetime.datetime.now()}] 拼接后的输入前100个字符: {prompt[:100]}...\n")
-                if len(prompt) > 200:
-                    f.write(f"[{datetime.datetime.now()}] 拼接后的输入后100个字符: ...{prompt[-100:]}\n")
-            
-            # Tokenize prompt for LLM
-            model_inputs = self.tokenizer([prompt], return_tensors="pt").to(self.device)
-            input_ids = model_inputs.input_ids.to(torch.int32)
-            
-            with open(self.log_file, "a") as f:
-                f.write(f"[{datetime.datetime.now()}] 分词后的输入token数量: {input_ids.shape[1]}\n")
-            
-            # Generate semantic tokens with LLM
-            generated_ids = self.forward_llm(input_ids)
-            
-            # Decode and extract semantic token IDs from generated text
-            predicted_text = self.tokenizer.batch_decode([generated_ids], skip_special_tokens=True)[0]
-            
-            with open(self.log_file, "a") as f:
-                f.write(f"[{datetime.datetime.now()}] 生成文本长度: {len(predicted_text)}\n")
-                f.write(f"[{datetime.datetime.now()}] 生成文本前100个字符: {predicted_text[:100]}...\n")
-            
-            pred_semantic_ids = (
-                torch.tensor([int(token) for token in re.findall(r"bicodec_semantic_(\d+)", predicted_text)])
-                .unsqueeze(0).to(torch.int32)
-            )
-            
-            with open(self.log_file, "a") as f:
-                f.write(f"[{datetime.datetime.now()}] 提取的语义token数量: {pred_semantic_ids.shape[1]}\n")
-            
-
-            # Generate audio with vocoder
-            audio = self.forward_vocoder(
-                global_token_ids.to(self.device),
-                pred_semantic_ids.to(self.device),
-            )
+            # 检查文本长度，如果超过100个字符，则分段处理
+            if len(target_text) > 100:
+                with open(self.log_file, "a") as f:
+                    f.write(f"[{datetime.datetime.now()}] 目标文本长度超过100，尝试分段处理\n")
+                
+                # 按标点符号分段
+                segments = []
+                current_segment = ""
+                punctuations = ['，', '。', '！', '？', '；', '：', ',', '.', '!', '?', ';', ':']
+                
+                for char in target_text:
+                    current_segment += char
+                    if char in punctuations and len(current_segment) >= 50:
+                        segments.append(current_segment)
+                        current_segment = ""
+                
+                # 处理最后一段
+                if current_segment:
+                    segments.append(current_segment)
+                
+                # 如果没有找到合适的分割点，则强制分割
+                if len(segments) <= 1 and len(target_text) > 100:
+                    segments = []
+                    for i in range(0, len(target_text), 80):
+                        segments.append(target_text[i:min(i+80, len(target_text))])
+                
+                with open(self.log_file, "a") as f:
+                    f.write(f"[{datetime.datetime.now()}] 文本被分为{len(segments)}段\n")
+                    for i, seg in enumerate(segments):
+                        f.write(f"[{datetime.datetime.now()}] 段落{i+1}: {seg}\n")
+                
+                # 处理每个段落并合并结果
+                all_audio_segments = []
+                
+                for i, segment in enumerate(segments):
+                    with open(self.log_file, "a") as f:
+                        f.write(f"[{datetime.datetime.now()}] 处理段落 {i+1}/{len(segments)}: {segment}\n")
+                    
+                    # 处理当前段落
+                    prompt, global_token_ids = process_prompt(
+                        text=segment,
+                        prompt_text=reference_text if i == 0 else None,  # 只在第一段使用参考文本
+                        global_token_ids=global_tokens,
+                        semantic_token_ids=semantic_tokens,
+                    )
+                    
+                    with open(self.log_file, "a") as f:
+                        f.write(f"[{datetime.datetime.now()}] 段落{i+1}拼接后的输入长度: {len(prompt)}\n")
+                    
+                    # Tokenize prompt for LLM
+                    model_inputs = self.tokenizer([prompt], return_tensors="pt").to(self.device)
+                    input_ids = model_inputs.input_ids.to(torch.int32)
+                    
+                    with open(self.log_file, "a") as f:
+                        f.write(f"[{datetime.datetime.now()}] 段落{i+1}分词后的输入token数量: {input_ids.shape[1]}\n")
+                    
+                    # Generate semantic tokens with LLM
+                    generated_ids = self.forward_llm(input_ids)
+                    
+                    # Decode and extract semantic token IDs from generated text
+                    predicted_text = self.tokenizer.batch_decode([generated_ids], skip_special_tokens=True)[0]
+                    
+                    with open(self.log_file, "a") as f:
+                        f.write(f"[{datetime.datetime.now()}] 段落{i+1}生成文本长度: {len(predicted_text)}\n")
+                    
+                    pred_semantic_ids = (
+                        torch.tensor([int(token) for token in re.findall(r"bicodec_semantic_(\d+)", predicted_text)])
+                        .unsqueeze(0).to(torch.int32)
+                    )
+                    
+                    with open(self.log_file, "a") as f:
+                        f.write(f"[{datetime.datetime.now()}] 段落{i+1}提取的语义token数量: {pred_semantic_ids.shape[1]}\n")
+                    
+                    # Generate audio with vocoder
+                    segment_audio = self.forward_vocoder_with_log(
+                        global_token_ids.to(self.device),
+                        pred_semantic_ids.to(self.device),
+                    )
+                    
+                    with open(self.log_file, "a") as f:
+                        f.write(f"[{datetime.datetime.now()}] 段落{i+1}生成的音频shape: {segment_audio.shape}\n")
+                    
+                    all_audio_segments.append(segment_audio)
+                
+                # 合并所有音频段落
+                with open(self.log_file, "a") as f:
+                    f.write(f"[{datetime.datetime.now()}] 合并{len(all_audio_segments)}个音频段落\n")
+                
+                # 简单拼接音频段落
+                audio = torch.cat(all_audio_segments, dim=1)
+                
+                with open(self.log_file, "a") as f:
+                    f.write(f"[{datetime.datetime.now()}] 合并后的音频shape: {audio.shape}\n")
+            else:
+                # 原始处理逻辑，不分段
+                prompt, global_token_ids = process_prompt(
+                    text=target_text,
+                    prompt_text=reference_text,
+                    global_token_ids=global_tokens,
+                    semantic_token_ids=semantic_tokens,
+                )
+                
+                with open(self.log_file, "a") as f:
+                    f.write(f"[{datetime.datetime.now()}] 拼接后的输入长度: {len(prompt)}\n")
+                    f.write(f"[{datetime.datetime.now()}] 拼接后的输入前100个字符: {prompt[:100]}...\n")
+                    if len(prompt) > 200:
+                        f.write(f"[{datetime.datetime.now()}] 拼接后的输入后100个字符: ...{prompt[-100:]}\n")
+                
+                # Tokenize prompt for LLM
+                model_inputs = self.tokenizer([prompt], return_tensors="pt").to(self.device)
+                input_ids = model_inputs.input_ids.to(torch.int32)
+                
+                with open(self.log_file, "a") as f:
+                    f.write(f"[{datetime.datetime.now()}] 分词后的输入token数量: {input_ids.shape[1]}\n")
+                
+                # Generate semantic tokens with LLM
+                generated_ids = self.forward_llm(input_ids)
+                
+                # Decode and extract semantic token IDs from generated text
+                predicted_text = self.tokenizer.batch_decode([generated_ids], skip_special_tokens=True)[0]
+                
+                with open(self.log_file, "a") as f:
+                    f.write(f"[{datetime.datetime.now()}] 生成文本长度: {len(predicted_text)}\n")
+                    f.write(f"[{datetime.datetime.now()}] 生成文本前100个字符: {predicted_text[:100]}...\n")
+                
+                pred_semantic_ids = (
+                    torch.tensor([int(token) for token in re.findall(r"bicodec_semantic_(\d+)", predicted_text)])
+                    .unsqueeze(0).to(torch.int32)
+                )
+                
+                with open(self.log_file, "a") as f:
+                    f.write(f"[{datetime.datetime.now()}] 提取的语义token数量: {pred_semantic_ids.shape[1]}\n")
+                
+                # Generate audio with vocoder
+                audio = self.forward_vocoder_with_log(
+                    global_token_ids.to(self.device),
+                    pred_semantic_ids.to(self.device),
+                )
             
             # Prepare response
             audio_tensor = pb_utils.Tensor.from_dlpack("waveform", to_dlpack(audio))
@@ -435,7 +528,7 @@ class TritonPythonModel:
             
             with open(self.log_file, "a") as f:
                 f.write(f"[{datetime.datetime.now()}] 请求 {request_idx+1} 处理完成\n")
-                             
+                            
         return responses
 
     def execute_orig(self, requests):
