@@ -17,6 +17,8 @@ jobs:
 
       - name: Add Upstream and Fetch Changes
         run: |
+          git config --global user.email "action@github.com"
+          git config --global user.name "jackx"
           git remote add upstream https://github.com/SparkAudio/Spark-TTS.git
           git fetch upstream
           git checkout main
